@@ -1,4 +1,4 @@
-# Automating Data Ingestion with AWS CDK
+## Introduction
 
 Data ingestion, the process of collecting and importing data for storage and analysis, is a crucial step in many data pipelines. In this blog post, we'll explore how to automate data ingestion workflows using the AWS Cloud Development Kit (CDK). We'll build a serverless solution that utilizes AWS Lambda functions, Amazon S3 buckets, Amazon SQS queues, and Amazon EventBridge (formerly known as CloudWatch Events).
 
@@ -24,7 +24,6 @@ export class LambdaDataIngestionStack extends cdk.Stack {
   public readonly destBucket: Bucket;
   public readonly populateQueueFunc: Function;
   public readonly ingestionFunc: Function;
-  public readonly unzipFunc: Function;
   public readonly queue: Queue;
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -54,7 +53,9 @@ In this block of code, we create an Amazon S3 bucket (`destBucket`) to store the
 
 ## Populating the Queue
 
-Next, we'll create a Lambda function to populate the SQS queue with messages. This function will be scheduled to run periodically using Amazon EventBridge.
+### Infrastructure
+
+Next, we'll provision a Lambda function to populate the SQS queue with messages. This function will be scheduled to run periodically using Amazon EventBridge.
 
 ```typescript
 // Lambda function to populate the SQS queue
@@ -72,6 +73,8 @@ this.populateQueueFunc = new Function(this, "PopulateQueueFunction", {
     BOOKMARK_KEY: "bookmark.txt",
   },
 });
+this.destBucket.grantReadWrite(this.populateQueueFunc);
+this.queue.grantSendMessages(this.populateQueueFunc);
 
 // Schedule Lambda function to run every 30 minutes
 const rule = new Rule(this, "PopulateQueueRule", {
@@ -86,11 +89,72 @@ rule.addTarget(
 );
 ```
 
-In this section, we define a Lambda function (`populateQueueFunc`) responsible for populating the SQS queue with messages. We schedule this function to run every 30 minutes using an Amazon EventBridge rule (`rule`). The function retrieves data from a source (not shown) and adds messages to the SQS queue.
+In this section, we define a Lambda function (`populateQueueFunc`) responsible for populating the SQS queue with messages. We give the function sufficient permissions to read and write to the bucket as well as send messages to the queue. We schedule this function to run every 30 minutes using an Amazon EventBridge rule (`rule`). The function retrieves data from GitHub Archives and adds messages to the SQS queue.
+
+### Queue Population Function Implementation
+
+The lambda handler for populating the queue is shown below:
+
+```python
+from datetime import datetime as dt
+from datetime import timedelta
+import requests
+import boto3
+import os
+
+sqs = boto3.client("sqs")
+s3 = boto3.client("s3")
+queue_url = os.environ["QUEUE_URL"]
+bucket_name = os.environ["BUCKET_NAME"]
+bookmark_key = os.environ["BOOKMARK_KEY"]
+
+
+data_url = "https://data.gharchive.org/"
+
+
+def save_bookmark(baseline_file):
+    s3.put_object(Bucket=bucket_name, Key=bookmark_key, Body=baseline_file.encode())
+
+
+def handler(event, context):
+    baseline_file = "2023-03-13-1.json.gz"
+    try:
+        bookmark = (
+            s3.get_object(Bucket=bucket_name, Key=bookmark_key)["Body"].read().decode()
+        )
+        baseline_file = bookmark
+    except:
+        save_bookmark(baseline_file)
+
+    dt_part = baseline_file.split(".")[0]
+    start_dt = dt.strptime(dt_part, "%Y-%M-%d-%H")
+    for i in range(1, 300):
+        start_dt += timedelta(hours=1)
+        file_dt = start_dt.strftime("%Y-%M-%d-%-H")
+        file_name = f"{file_dt}.json.gz"
+        res = requests.head(data_url + file_name)
+        if (res.status_code) == 200:
+            sqs.send_message(
+                QueueUrl=queue_url,
+                MessageBody=file_name,
+            )
+            baseline_file = file_name
+        else:
+            break
+        if i % 50 == 0:
+            save_bookmark(file_name)
+    save_bookmark(file_name)
+
+    return {"statusCode": 200, "body": "success"}
+```
+
+The implemented solution leverages a bookmarking mechanism, utilizing an S3 object to store the filename of the last processed data file. This enables seamless resumption of data processing from the point of interruption. Through iterative data processing, the Lambda function systematically scans potential data files on GitHub Archive, verifying their availability via HTTP HEAD requests. Upon discovering a new data file, its filename is promptly added to an SQS queue for subsequent processing. The bookmark is updated in S3 periodically to safeguard against the function timing out and to maintain continuity in processing operations.
 
 ## Ingesting Data
 
-Now, let's create a Lambda function to ingest data from the SQS queue and store it in the S3 bucket.
+### Infrastructure
+
+Now, let's provision a Lambda function to ingest data from the SQS queue and store it in the S3 bucket.
 
 ```typescript
 // Lambda function to ingest data from SQS queue
@@ -116,9 +180,41 @@ this.ingestionFunc.addEventSource(
     maxConcurrency: 5,
   })
 );
+
+this.queue.grantConsumeMessages(this.ingestionFunc);
+this.destBucket.grantReadWrite(this.ingestionFunc);
 ```
 
-In this segment, we define a Lambda function (`ingestionFunc`) responsible for ingesting data from the SQS queue and storing it in the S3 bucket. We configure the function to process messages from the SQS queue in batches of 5 with a maximum concurrency of 5.
+In this segment, we provision a Lambda function (`ingestionFunc`) responsible for ingesting data from the SQS queue and storing it in the S3 bucket. We configure the function to process messages from the SQS queue in batches of 5 with a maximum concurrency of 5. We then grant the ingestion function the permissions to consume messages from the queue and to read and write to the S3 bucket.
+
+### Data Ingestion Function
+
+```python
+import json
+import requests
+import boto3
+import os
+
+data_url = "https://data.gharchive.org/"
+dest_bucket_name = os.environ["DEST_BUCKET_NAME"]
+prefix = os.environ["PREFIX"]
+queue_url = os.environ["QUEUE_URL"]
+
+s3 = boto3.client("s3")
+sqs = boto3.client("sqs")
+
+
+def handler(event, context):
+    for record in event.get("Records", []):
+        file = record.get("body")
+        res = requests.get(data_url + file)
+        s3.put_object(Bucket=dest_bucket_name, Key=f"{prefix}/{file}", Body=res.content)
+        sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=record["receiptHandle"])
+    return {"statusCode": 200, "body": "success"}
+
+```
+
+The Lambda function responds to new messages in the SQS queue. It retrieves each message, extracts the filename, and downloads the corresponding data file from a URL constructed using the filename. This file is then uploaded to an Amazon S3 bucket designated by predefined parameters. Upon successful transfer, the Lambda function removes the processed message from the SQS queue to prevent duplication. This streamlined process ensures the efficient and reliable transfer of data files from SQS to S3, facilitating automated and scalable data handling operations.
 
 ## Conclusion
 
